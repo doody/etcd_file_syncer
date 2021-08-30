@@ -21,7 +21,8 @@ const (
 )
 
 var (
-	etcdClient *clientv3.Client
+	etcdClient    *clientv3.Client
+	fileChangeMap map[string]time.Time
 )
 
 // HTTP POST Model - /putFile
@@ -42,6 +43,9 @@ func main() {
 	// Preparing ARGS
 	arg.MustParse(&CMDArgs)
 
+	// Init map
+	fileChangeMap = make(map[string]time.Time)
+
 	// ETCD Connection
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   CMDArgs.ETCDEndpoints,
@@ -59,6 +63,28 @@ func main() {
 	// ETCD Testing
 	readKeyAndSaveToFolder(CMDArgs.ConfigKey, CMDArgs.ConfigFolder)
 	go watchKeyAndSaveToFile(CMDArgs.ConfigKey, CMDArgs.ConfigFolder)
+
+	// Periodic folder check
+	go func() {
+		for range time.Tick(15 * time.Second) {
+			fileToUpload, err := walkConfigFolder(CMDArgs.ConfigFolder)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"err": err,
+				}).Error("config folder walker failed")
+			}
+			for _, filePath := range fileToUpload {
+				etcdKey, err := filepath.Rel(CMDArgs.ConfigFolder, filePath)
+				if err != nil {
+					log.WithFields(log.Fields{
+						"filePath": filePath,
+						"err":      err,
+					}).Error("cannot extract etcdkey from filepath")
+				}
+				putFileToETCD(etcdKey, filePath)
+			}
+		}
+	}()
 
 	// HTTP server
 	r := gin.Default()
@@ -134,7 +160,14 @@ func watchKeyAndSaveToFile(etcdKey, fileFolder string) (err error) {
 					return err
 				}
 			case clientv3.EventTypePut:
-				saveToFolder(filePath, ev.Kv.Value)
+				fileInfo, err := saveToFolder(filePath, ev.Kv.Value)
+				if err != nil {
+					log.WithFields(log.Fields{
+						"fileName": fileInfo.Name(),
+						"err":      err,
+					}).Error("cannot get file info")
+				}
+				fileChangeMap[filePath] = fileInfo.ModTime()
 			}
 		}
 	}
@@ -159,29 +192,44 @@ func readKeyAndSaveToFolder(etcdKey, fileFolder string) (err error) {
 			"etcdKey": string(ev.Key),
 		}).Info("read key")
 		filePath := filepath.Join(fileFolder, string(ev.Key))
-		saveToFolder(filePath, ev.Value)
+		fileInfo, err := saveToFolder(filePath, ev.Value)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"fileName": fileInfo.Name(),
+				"err":      err,
+			}).Error("cannot get file info")
+		}
+		fileChangeMap[filePath] = fileInfo.ModTime()
 	}
 	return nil
 }
 
-// saveToFolder will save fileContent to to filePath, if file path contain /, it will treat it as folder and
+// saveToFolder will save fileContent to filePath, if file path contain /, it will treat it as folder and
 // create, ex: test/config.json will create folder test and write file into config.json
-func saveToFolder(filePath string, fileContent []byte) (err error) {
+func saveToFolder(filePath string, fileContent []byte) (fileInfo os.FileInfo, err error) {
 	if err := ensureDir(filepath.Dir(filePath)); err != nil {
 		log.WithFields(log.Fields{
 			"filePath": filePath,
 			"err":      err,
 		}).Error("cannot create folder")
-		return err
+		return nil, err
 	}
 	if err := os.WriteFile(filePath, fileContent, 0644); err != nil {
 		log.WithFields(log.Fields{
 			"filePath": filePath,
 			"err":      err,
 		}).Error("cannot write file")
-		return err
+		return nil, err
 	}
-	return nil
+	fileInfo, err = os.Stat(filePath)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"filePath": filePath,
+			"err":      err,
+		}).Error("cannot get file info")
+		return nil, err
+	}
+	return fileInfo, nil
 }
 
 // ensureDir will create folder if not exist
@@ -202,4 +250,38 @@ func ensureDir(dirName string) error {
 		return nil
 	}
 	return err
+}
+
+// File change monitoring
+
+// walkConfigFolder will walk through configFolder and record last time changed to fileChangeMap
+func walkConfigFolder(configFolder string) (fileToUpload []string, err error) {
+	err = filepath.Walk(configFolder,
+		func(filePath string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
+				if val, ok := fileChangeMap[filePath]; ok {
+					if info.ModTime().After(val) {
+						log.WithFields(log.Fields{
+							"filePath":   filePath,
+							"lastMod":    val.Local(),
+							"currentMod": info.ModTime().Local(),
+						}).Info("find modified local file")
+						fileToUpload = append(fileToUpload, filePath)
+					}
+				}
+				fileChangeMap[filePath] = info.ModTime()
+			}
+			return nil
+		})
+	if err != nil {
+		log.WithFields(log.Fields{
+			"configFolder": configFolder,
+			"err":          err,
+		}).Error("config walker error")
+		return nil, err
+	}
+	return fileToUpload, nil
 }
