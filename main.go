@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"time"
 
+	arg "github.com/alexflint/go-arg"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -28,10 +30,21 @@ type FileModel struct {
 	FilePath string `json:"filePath"`
 }
 
+// CMD ARGS
+var CMDArgs struct {
+	ConfigFolder  string   `arg:"-f,--folder,required"`
+	ConfigKey     string   `arg:"-k,--key,required"`
+	ServerPort    int      `arg:"-p,--port" default:"3000"`
+	ETCDEndpoints []string `arg:"--etcd,required"`
+}
+
 func main() {
+	// Preparing ARGS
+	arg.MustParse(&CMDArgs)
+
 	// ETCD Connection
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{"192.168.1.120:2379"},
+		Endpoints:   CMDArgs.ETCDEndpoints,
 		DialTimeout: dialTimeout,
 	})
 	if err != nil {
@@ -44,8 +57,8 @@ func main() {
 	defer cli.Close()
 
 	// ETCD Testing
-	readKeyAndSaveToFolder("", "./etcd_files")
-	go watchKeyAndSaveToFile("", "./etcd_files")
+	readKeyAndSaveToFolder(CMDArgs.ConfigKey, CMDArgs.ConfigFolder)
+	go watchKeyAndSaveToFile(CMDArgs.ConfigKey, CMDArgs.ConfigFolder)
 
 	// HTTP server
 	r := gin.Default()
@@ -71,7 +84,7 @@ func main() {
 		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-	r.Run(":3000") // listen and serve on 0.0.0.0:3000
+	r.Run(fmt.Sprintf(":%d", CMDArgs.ServerPort)) // listen and serve on 0.0.0.0:3000
 }
 
 // putFileToETCD will read filePath into string and write into ETCD using etcdKey
@@ -108,7 +121,7 @@ func watchKeyAndSaveToFile(etcdKey, fileFolder string) (err error) {
 		for _, ev := range wresp.Events {
 			log.WithFields(log.Fields{
 				"eventType": ev.Type,
-				"etcdKey":   ev.Kv.Key,
+				"etcdKey":   string(ev.Kv.Key),
 			}).Info("ETCD file changed")
 			filePath := filepath.Join(fileFolder, string(ev.Kv.Key))
 			switch ev.Type {
@@ -151,6 +164,8 @@ func readKeyAndSaveToFolder(etcdKey, fileFolder string) (err error) {
 	return nil
 }
 
+// saveToFolder will save fileContent to to filePath, if file path contain /, it will treat it as folder and
+// create, ex: test/config.json will create folder test and write file into config.json
 func saveToFolder(filePath string, fileContent []byte) (err error) {
 	if err := ensureDir(filepath.Dir(filePath)); err != nil {
 		log.WithFields(log.Fields{
