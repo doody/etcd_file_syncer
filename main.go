@@ -255,6 +255,7 @@ func ensureDir(dirName string) error {
 // File change monitoring
 
 // walkConfigFolder will walk through configFolder and record last time changed to fileChangeMap
+// and also return filePath string list which current modified time > last modified time recorded in fileChangeMap
 func walkConfigFolder(configFolder string) (fileToUpload []string, err error) {
 	err = filepath.Walk(configFolder,
 		func(filePath string, info os.FileInfo, err error) error {
